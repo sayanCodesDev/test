@@ -1,138 +1,184 @@
-# 🧠 IRT Adaptive Learning Engine API
+# 🧠 IRT-Based Adaptive Learning Engine API
 
-A production-ready, mathematically rigorous **Item Response Theory (IRT)** adaptive learning backend built with **TypeScript**, **Express**, **Prisma 7**, and **Supabase (PostgreSQL)**.
+A production-ready, mathematically rigorous **Item Response Theory (IRT)** adaptive question selection backend built with **TypeScript**, **Express**, **Prisma 7**, and **PostgreSQL (Neon / Supabase)**.
 
-This backend dynamically estimates a student's ability ($\theta$) per topic and serves the most informative, appropriate questions in real time using the **1-Parameter Logistic (1PL) Rasch IRT Model**.
-
----
-
-## 📐 How It Works (IRT Mathematical Foundation)
-
-### 1. Ability ($\theta$) & Question Difficulty ($b$) Scales
-* Both **Student Ability** ($\theta$) and **Question Difficulty** ($b$) exist on a continuous logit scale centered at `0`:
-  * $\theta = 0 \to$ Average ability / default start for new topic
-  * $\theta < 0 \to$ Weaker ability (e.g., $-1.5$ = beginner)
-  * $\theta > 0 \to$ Stronger ability (e.g., $+1.5$ = advanced)
-  * $b \in [-3, +3] \to$ Question difficulty ($-2$ easy, $0$ medium, $+2$ hard)
-* **Topic Isolation**: Every student maintains an independent $\theta$ for *each* topic (e.g., Algebra $\theta = +0.8$, Geometry $\theta = -0.4$). Updating Algebra ability does **not** affect Geometry.
+This system dynamically estimates a student's ability ($\theta$) per topic and serves the most informative, appropriate questions in real-time using an optimized **Two-Stage 1PL Rasch IRT Model** with **Pedagogical Safeguards**.
 
 ---
 
-### 2. Probability of Correct Answer — 1PL Rasch Model
-The probability $P$ that a student with ability $\theta$ answers a question of difficulty $b$ correctly is:
+## 🌟 Key Highlights & Architectural Optimizations
 
-$$P(\text{correct}) = \frac{1}{1 + e^{-(\theta - b)}} = \text{sigmoid}(\theta - b)$$
+| Feature / Optimization | Description | Why It Matters |
+|---|---|---|
+| **1PL Rasch IRT Model** | $P(\text{correct}) = \text{sigmoid}(\theta - b)$ | Mathematically rigorous ability estimation centered at $\theta = 0$. |
+| **Two-Stage Selection** | Stage 1: DB filtering $\to$ Stage 2: Composite ranking | Prevents loading thousands of questions into memory ($O(k)$ DB candidate generation). |
+| **Progressive Difficulty Window** | Expands window ($\pm 0.25 \to \pm 0.50 \to \pm 1.00 \to \pm 2.00 \to \infty$) | Stops expanding as soon as $\ge 5$ candidates are found. Prevents over-widening. |
+| **Composite IRT Ranking** | $0.70 \cdot \text{Info} + 0.20 \cdot \text{DiffProx} + 0.10 \cdot \text{Pedagogy}$ | Information is dominant, while smoothing difficulty jumps and honoring recency. |
+| **Soft Difficulty Jump Limit** | $|b - \theta| \le 2.0$ logits | Prevents extreme, frustrating difficulty swings (e.g. $b=-2 \to b=+3$). |
+| **Continuous Pedagogy Signal** | Recency-weighted 5-answer window | Adjusts selection target ($\theta_{\text{effective}}$) without corrupting stored mathematical $\theta$. |
+| **Indexed DB Queries** | `@@index([topicId, difficulty])` & `@@index([sessionId, studentId])` | High-performance PostgreSQL range queries for large item banks. |
+| **Explainable Selection** | `SelectionDiagnostics` payload returned | Human-readable explanation of why every question was selected for debugging/insights. |
+| **Idempotent Answers** | `@@unique([studentId, questionId, sessionId])` | Safe against double-clicks, network retries, or duplicate submissions. |
+| **115 passing tests** | 38 Math + 62 Selector + 15 Adaptive Simulation tests | 100% verified correctness and numerical stability. |
 
-* Implemented using a **numerically stable sigmoid** function clamped to prevent overflow or NaN/Infinity values.
+---
+
+## 📐 How the Adaptive Engine Works
+
+### 1. Two-Stage Question Selection Pipeline
+
+When a student requests the next question or submits an answer, the selection process follows a two-stage architecture:
+
+```
+                          All Topic Questions in DB
+                                     │
+                                     ▼
+      ┌─────────────────────────────────────────────────────────────┐
+      │  STAGE 1: DB-Side Candidate Generation                       │
+      │  - Exclude already-answered questions in current session      │
+      │  - Progressive Window Search around effectiveTheta:         │
+      │    Try ±0.25 → ±0.50 → ±1.00 → ±2.00 → ∞                    │
+      │  - Stop as soon as MIN_CANDIDATES (5) are found             │
+      └──────────────────────────────┬──────────────────────────────┘
+                                     │ (only ~5-15 candidates loaded)
+                                     ▼
+      ┌─────────────────────────────────────────────────────────────┐
+      │  STAGE 2: Composite Ranking & Filtering                     │
+      │  - Compute IRT Item Information: I = P * (1 - P)            │
+      │  - Compute Difficulty Proximity: e^(-|b - effectiveTheta|)  │
+      │  - Compute Pedagogy Alignment Score                         │
+      │  - Compute Composite Score (70% Info + 20% Diff + 10% Ped)  │
+      │  - Apply Soft Max-Difficulty-Jump limit (|b - θ| ≤ 2.0)     │
+      └──────────────────────────────┬──────────────────────────────┘
+                                     │
+                                     ▼
+                        Winning Question Served
+```
+
+---
+
+### 2. IRT Mathematical Foundation
+
+#### A. Probability of Correct Answer
+$$P(\text{correct} \mid \theta, b) = \frac{1}{1 + e^{-(\theta - b)}} = \text{sigmoid}(\theta - b)$$
+* $\theta$ = Student ability ($-4.0$ to $+4.0$, centered at $0$).
+* $b$ = Question difficulty ($-3.0$ to $+3.0$, centered at $0$).
 * When $\theta = b \implies P = 0.5$ ($50\%$ chance of success).
 
----
-
-### 3. Online Ability Update Rule
-After every submitted answer, the student's ability is updated immediately on the server:
-
-$$\theta_{\text{new}} = \text{clamp}\left(\theta_{\text{old}} + \alpha \cdot (\text{response} - P),\, \theta_{\text{min}},\, \theta_{\text{max}}\right)$$
-
+#### B. Online Ability Update Rule
+After every submitted answer, the student's stored ability is updated:
+$$\theta_{\text{new}} = \text{clamp}\left(\theta_{\text{old}} + \alpha \cdot (\text{response} - P),\, -4.0,\, +4.0\right)$$
 * $\text{response} \in \{0, 1\}$ ($1$ = correct, $0$ = incorrect).
-* $\alpha = 0.3$ (configurable learning rate — responsive yet stable).
-* $\theta$ is strictly clamped within $[-4.0, +4.0]$.
-* **Intuition**:
-  * Correct answer on a hard question ($P$ low) $\to$ Larger increase in $\theta$.
-  * Correct answer on an easy question ($P$ high) $\to$ Minor increase in $\theta$.
-  * Incorrect answer on an easy question ($P$ high) $\to$ Larger decrease in $\theta$.
+* $\alpha = 0.3$ (learning rate — responsive yet stable).
+
+#### C. Item Information ($I$)
+$$I(\theta, b) = P \cdot (1 - P)$$
+* Maximized ($0.25$) when $P = 0.50$ (question difficulty matches student ability).
 
 ---
 
-### 4. Maximum Item Information Question Selection
-To maximize measurement precision, the engine selects the available candidate question that provides the highest **Item Information** $I(\theta)$:
+### 3. Pedagogical Context & Safeguards
 
-$$I(\theta) = P \cdot (1 - P)$$
+The engine separates **mathematical ability** ($\theta$) from **pedagogical adaptation** ($\theta_{\text{effective}}$):
 
-* Information peak occurs at $P = 0.5$ (when $b \approx \theta$).
-* The system naturally selects questions matching the student's current skill level.
-* **Already answered questions in the session are strictly excluded** so questions are never repeated.
-
----
-
-### 5. Pedagogical Safeguards
-To make the learning experience natural and supportive:
-* **Struggle Safeguard**: If the student answers $3$ consecutive questions incorrectly in a session, selection uses an effective target $\theta_{\text{eff}} = \theta - 0.5$ (serving slightly easier questions to build confidence).
-* **Streak Safeguard**: If the student answers $3$ consecutive questions correctly, selection uses $\theta_{\text{eff}} = \theta + 0.3$ (gradually challenging strong performance).
-* *Note: Safeguards only affect selection scoring and do not corrupt the true stored $\theta$.*
+* **Recency-Weighted Pedagogy Score**: Analyzes the last 5 answers in the session. Recent answers carry higher weights ($5, 4, 3, 2, 1$).
+* **Struggling Signal (Score $< 0$)**: Temporarily biases selection toward easier questions ($\theta_{\text{effective}} = \theta - 0.5 \cdot |\text{score}|$) to rebuild confidence.
+* **Streak Signal (Score $> 0$)**: Temporarily biases selection toward harder questions ($\theta_{\text{effective}} = \theta + 0.3 \cdot \text{score}$) to challenge strong performance.
+* **Crucial Rule**: Pedagogical adjustments only affect question selection. The stored mathematical ability $\theta$ is **never corrupted**.
 
 ---
 
-## 🔄 End-to-End Server Answer Flow
-
-The backend is the **single source of truth**. The client/frontend NEVER determines correctness, $\theta$, or the next question.
+## 🔄 End-to-End Answer Flow
 
 ```
 POST /api/sessions/:sessionId/answers  { questionId, selectedOption }
   │
-  ├── 1. Server validates request parameters
-  ├── 2. Loads Session & Question from DB
-  ├── 3. Idempotency Check: UNIQUE(studentId, questionId, sessionId)
-  │      └── If already answered → returns cached result (no double θ update)
-  ├── 4. Server determines correctness (selectedOption === question.correctOption)
-  ├── 5. Server fetches current student θ for the topic
-  ├── 6. Calculates probability P = sigmoid(θ - b) and information I = P*(1-P)
-  ├── 7. Computes new ability: θ_new = clamp(θ + α*(response - P))
-  ├── 8. Persists QuestionResponse log (stores thetaBefore, thetaAfter, expectedP)
-  ├── 9. Upserts new θ into StudentAbility
-  ├── 10. Computes effective theta with recent performance safeguards
-  ├── 11. Ranks all unanswered topic questions by maximum item information
-  └── 12. Returns response with correctness, updated θ, and next sanitized question
+  ├── 1. Validate session, question, & option parameters
+  ├── 2. Idempotency Check: UNIQUE(studentId, questionId, sessionId)
+  │      └── If duplicate → returns cached result without re-updating θ
+  ├── 3. Server determines correctness (selectedOption === question.correctOption)
+  ├── 4. Fetch current student θ for topic
+  ├── 5. Compute P(correct) & update ability: θ_new = clamp(θ + α*(response - P))
+  ├── 6. Store QuestionResponse audit log (thetaBefore, thetaAfter, expectedP)
+  ├── 7. Upsert new θ into StudentAbility table
+  ├── 8. Calculate recent response history & continuous pedagogy score
+  ├── 9. Run Stage 1 DB progressive window query for next candidate set
+  ├── 10. Run Stage 2 composite ranking (70% Info + 20% Diff + 10% Pedagogy)
+  └── 11. Return response with correctness, updated θ, and sanitized next question
 ```
 
 ---
 
-## 🛠️ Architecture & Tech Stack
+## 📁 Project Structure
 
 ```
 temp_api/
 ├── prisma/
-│   └── schema.prisma         # Database models (Topic, Question, Student, Ability, Session, Response)
+│   ├── schema.prisma         # Models + Composite DB Indexes
+│   └── seed.ts               # Seed script for topics, questions, & students
 ├── prisma.config.ts          # Prisma 7 datasourceUrl configuration
 ├── src/
 │   ├── config/
-│   │   └── irt.ts            # Centralized IRT constants & parameters
+│   │   └── irt.ts            # Centralized IRT config & window/weight parameters
 │   ├── db/
-│   │   └── prisma.ts         # Singleton Prisma 7 database client
+│   │   └── prisma.ts         # Prisma 7 singleton client with @prisma/adapter-pg
 │   ├── middleware/
 │   │   └── errorHandler.ts   # Express error handling middleware & ApiError
 │   ├── routes/
-│   │   ├── students.ts       # Student management & ability profile endpoints
-│   │   ├── topics.ts         # Topic creation & listing endpoints
-│   │   ├── questions.ts      # Question management endpoints (scoped under topic)
-│   │   ├── sessions.ts       # Quiz session endpoints & next-question fetch
-│   │   └── answers.ts        # Answer submission & adaptive loop entry point
+│   │   ├── students.ts       # Student management & ability profiles
+│   │   ├── topics.ts         # Topic endpoints
+│   │   ├── questions.ts      # Question endpoints (scoped under topic)
+│   │   ├── sessions.ts       # Quiz session & next-question endpoints
+│   │   └── answers.ts        # Answer submission entry point
 │   ├── services/
 │   │   ├── irt.ts            # Pure IRT math (sigmoid, P, I, theta update)
-│   │   ├── irtSelector.ts    # Pure adaptive scoring & ranking algorithms
-│   │   ├── abilityService.ts # Topic ability database persistence
-│   │   ├── questionSelector.ts # DB candidate question fetching & filtering
-│   │   └── quizService.ts    # Full quiz flow orchestrator
+│   │   ├── irtSelector.ts    # Two-stage scoring, composite ranking, pedagogy
+│   │   ├── abilityService.ts # Ability database persistence
+│   │   ├── questionSelector.ts # DB candidate fetcher (Stage 1) & coordinator
+│   │   └── quizService.ts    # Full answer orchestrator
 │   └── index.ts              # Express application entry point
 └── tests/
     ├── unit/
     │   ├── irt.test.ts       # Pure IRT math unit tests (38 tests)
-    │   └── questionSelector.test.ts # Adaptive selector unit tests (14 tests)
+    │   └── questionSelector.test.ts # Two-stage selector & edge-case tests (62 tests)
     └── simulation/
-        └── simulation.test.ts # 3-student probabilistic adaptive simulation (11 tests)
+        └── simulation.test.ts # Adaptive simulation for 3 student profiles (15 tests)
 ```
 
 ---
 
-## 📊 Database Schema (Prisma Models)
+## 🗄️ Database Schema & Indexes
 
-* **`Topic`**: Subject area (e.g. "Algebra").
-* **`Question`**: Belongs to a Topic. Contains `text`, `options` (JSON), `correctOption` (0-indexed integer), and `difficulty` ($b \in [-3, +3]$).
-* **`Student`**: User entity (`name`, `email`).
-* **`StudentAbility`**: Unique `(studentId, topicId)` composite key storing `theta` ($\theta$). Default = `0`.
-* **`QuizSession`**: Tracks a learning session (`studentId`, `topicId`, `startedAt`, `endedAt`).
-* **`QuestionResponse`**: Full audit log for every submitted answer:
-  * `(studentId, questionId, sessionId)` has a **UNIQUE constraint** guaranteeing idempotency (duplicate POSTs will not double-update ability).
-  * Stores `correct`, `thetaBefore`, `thetaAfter`, `questionDifficulty`, and `expectedProbability`.
+```prisma
+model Question {
+  id            Int      @id @default(autoincrement())
+  topicId       Int
+  text          String
+  options       Json     // Array of options
+  correctOption Int      // 0-indexed integer (never sent to client)
+  difficulty    Float    // IRT b-parameter (-3.0 to +3.0)
+
+  // Composite index for Stage 1 candidate queries
+  @@index([topicId, difficulty])
+}
+
+model QuestionResponse {
+  id                  Int      @id @default(autoincrement())
+  sessionId           Int
+  studentId           Int
+  questionId          Int
+  topicId             Int
+  selectedOption      Int
+  correct             Boolean
+  thetaBefore         Float
+  thetaAfter          Float
+  questionDifficulty  Float
+  expectedProbability Float
+
+  @@unique([studentId, questionId, sessionId])  // Idempotency
+  @@index([sessionId, studentId])                // Recent history index
+}
+```
 
 ---
 
@@ -140,185 +186,102 @@ temp_api/
 
 ### 1. Prerequisites
 * **Node.js**: v18+
-* **npm**: v9+
-* **PostgreSQL Database** (e.g., [Supabase](https://supabase.com))
+* **PostgreSQL Database** (Neon or Supabase)
 
-### 2. Environment Setup
-Copy `.env.example` to `.env` and set your Supabase database connection string:
-
-```bash
-cp .env.example .env
-```
-
-Set your `DATABASE_URL` in `.env`:
+### 2. Setup Environment
+Create `.env` file:
 ```env
-DATABASE_URL="postgresql://postgres:[PASSWORD]@[HOST]:5432/postgres"
+DATABASE_URL="postgresql://user:password@host:5432/neondb?sslmode=require"
 PORT=3000
 NODE_ENV=development
 ```
 
-### 3. Database Migration
-Push the Prisma schema to your PostgreSQL database:
-
+### 3. Run Database Migrations
 ```bash
-npx prisma migrate dev --name init
+npx prisma migrate dev
 ```
 
-Generate the Prisma Client:
+### 4. Seed Demo Data
+Populates 3 topics (Algebra, Geometry, Physics), 19 questions across difficulty spectrum ($b \in [-2.0, +2.3]$), and 3 demo students:
 ```bash
-npx prisma generate
+npm run db:seed
 ```
 
-### 4. Running the Application
-
-* **Development mode** (with auto-reload):
-  ```bash
-  npm run dev
-  ```
-
-* **Build for production**:
-  ```bash
-  npm run build
-  npm start
-  ```
-
-* **Type Check**:
-  ```bash
-  npm run typecheck
-  ```
+### 5. Start Development Server
+```bash
+npm run dev
+```
 
 ---
 
-## 🧪 Testing & Simulation
+## 🧪 Testing & Verification
 
-The test suite includes **63 automated tests** verifying IRT calculations, safeguards, edge cases, and adaptive simulation.
-
-Run all tests:
+Run the full test suite (**115 passing tests** across 3 test suites):
 ```bash
 npm test
 ```
 
-### Simulation Test
-`tests/simulation/simulation.test.ts` runs 3 simulated students through 25 adaptive questions:
+### Simulation Testing (`tests/simulation/simulation.test.ts`)
+Simulates 3 student types over 25 adaptive questions:
 1. **Beginner** ($\theta_{\text{true}} = -1.0$)
 2. **Average** ($\theta_{\text{true}} = 0.0$)
 3. **Advanced** ($\theta_{\text{true}} = +1.0$)
 
-The simulation probabilistically generates answer correctness using $P(\text{correct})$ and verifies that:
-* Estimated $\theta$ converges toward true ability.
-* Advanced students receive harder questions on average than Beginner students.
-* Question difficulty adapts smoothly without single-answer wild jumps.
-* No `NaN` or `Infinity` reaches state or database.
+**Verified Behaviors**:
+* ✅ $\theta$ estimate converges toward true student ability.
+* ✅ Advanced students receive harder questions than Beginner students on average.
+* ✅ No difficulty jumps exceed max jump limit.
+* ✅ Zero question repetitions within a session.
+* ✅ No `NaN` or `Infinity` under any condition.
 
 ---
 
 ## 📡 API Reference
 
-### 1. Students
+### 1. Students & Topics
 
 #### Create Student
 `POST /api/students`
 ```json
-// Request
-{
-  "name": "Riya Sharma",
-  "email": "riya@example.com"
-}
-
-// Response (201 Created)
-{
-  "student": {
-    "id": 1,
-    "name": "Riya Sharma",
-    "email": "riya@example.com",
-    "createdAt": "2026-08-08T10:00:00.000Z"
-  }
-}
+{ "name": "Aarav Patel", "email": "aarav@example.com" }
 ```
 
 #### Get Student Profile & Topic Abilities
-`GET /api/students/:id`
+`GET /api/students/1`
 ```json
-// Response (200 OK)
 {
-  "student": { "id": 1, "name": "Riya Sharma", "email": "riya@example.com" },
+  "student": { "id": 1, "name": "Aarav Patel", "email": "aarav@example.com" },
   "abilities": [
-    { "topicId": 1, "topicName": "Algebra", "theta": 0.45 },
-    { "topicId": 2, "topicName": "Geometry", "theta": -0.30 }
+    { "topicId": 1, "topicName": "Algebra", "theta": 0.35 },
+    { "topicId": 2, "topicName": "Geometry", "theta": -0.20 }
   ]
 }
 ```
 
 ---
 
-### 2. Topics & Questions
-
-#### Create Topic
-`POST /api/topics`
-```json
-{ "name": "Algebra" }
-```
-
-#### Add Question to Topic
-`POST /api/topics/:topicId/questions`
-```json
-// Request
-{
-  "text": "Solve for x: 2x + 4 = 10",
-  "options": ["x = 2", "x = 3", "x = 4", "x = 5"],
-  "correctOption": 1,
-  "difficulty": 0.0
-}
-
-// Response (201 Created) — correctOption is NEVER returned to client
-{
-  "question": {
-    "id": 10,
-    "topicId": 1,
-    "text": "Solve for x: 2x + 4 = 10",
-    "options": ["x = 2", "x = 3", "x = 4", "x = 5"],
-    "difficulty": 0.0,
-    "createdAt": "2026-08-08T10:00:00.000Z"
-  }
-}
-```
-
----
-
-### 3. Quiz Sessions & Adaptive Flow
+### 2. Quiz Sessions & Adaptive Flow
 
 #### Start Quiz Session
 `POST /api/sessions`
 ```json
-// Request
-{
-  "studentId": 1,
-  "topicId": 1
-}
-
-// Response (201 Created)
-{
-  "session": { "id": 101, "studentId": 1, "topicId": 1, "startedAt": "..." },
-  "student": { "id": 1, "name": "Riya Sharma" },
-  "topic": { "id": 1, "name": "Algebra" }
-}
+{ "studentId": 1, "topicId": 1 }
 ```
 
 #### Get Next Adaptive Question
 `GET /api/sessions/:sessionId/next-question`
 ```json
-// Response (200 OK)
 {
   "question": {
-    "id": 10,
+    "id": 4,
     "topicId": 1,
-    "text": "Solve for x: 2x + 4 = 10",
-    "options": ["x = 2", "x = 3", "x = 4", "x = 5"],
+    "text": "Find the roots of x² - 5x + 6 = 0",
+    "options": ["x = 1, 6", "x = 2, 3", "x = -2, -3", "x = 0, 5"],
     "difficulty": 0.0
   },
   "theta": 0.0,
   "effectiveTheta": 0.0,
-  "reason": "Selected by maximum item information (Rasch 1PL)"
+  "reason": "Selected by composite IRT score [info=1.000, difficulty=1.000, pedagogy=0.500, final=0.950]. Effective θ=0.000 (neutral recent performance). Question difficulty=0.00."
 }
 ```
 
@@ -327,7 +290,7 @@ The simulation probabilistically generates answer correctness using $P(\text{cor
 ```json
 // Request
 {
-  "questionId": 10,
+  "questionId": 4,
   "selectedOption": 1
 }
 
@@ -340,21 +303,21 @@ The simulation probabilistically generates answer correctness using $P(\text{cor
   "information": 0.25,
   "effectiveTheta": 0.15,
   "nextQuestion": {
-    "id": 14,
+    "id": 5,
     "topicId": 1,
-    "text": "Solve for x: x^2 - 9 = 0",
-    "options": ["x = ±3", "x = 3", "x = 9", "x = 0"],
-    "difficulty": 0.2
+    "text": "What is the slope of line passing through (2,3) and (6,11)?",
+    "options": ["1", "2", "3", "4"],
+    "difficulty": 0.7
   },
-  "nextQuestionReason": "Selected by maximum item information (Rasch 1PL)",
+  "nextQuestionReason": "Selected by composite IRT score [info=0.865, difficulty=0.577, pedagogy=0.500, final=0.771]. Effective θ=0.150 (neutral recent performance). Question difficulty=0.70.",
   "duplicate": false
 }
 ```
 
 ---
 
-## 🔒 Security & Reliability Guarantees
+## 🔒 Security & Reliability
 
-1. **Idempotency**: Duplicate HTTP calls (e.g. user double-clicking submit or network retry) match the `@@unique([studentId, questionId, sessionId])` constraint and safely return the cached result without double-updating ability.
-2. **Server Authority**: Answer correctness is evaluated purely on the server. `correctOption` is never sent in question payloads.
-3. **Numerical Safety**: All IRT inputs/outputs pass through finite validation and clamping to prevent `NaN` or `Infinity` from reaching the database.
+1. **Server-Side Correctness**: `correctOption` is stripped from all API outputs via `sanitizeQuestion()`.
+2. **Idempotency**: Duplicate POST requests return cached results without double-updating ability scores.
+3. **Finite Safeguards**: All inputs are checked with `Number.isFinite()`, clamping, and fallback values to ensure zero runtime crashes.
