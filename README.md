@@ -379,3 +379,10 @@ npm test
 1. **Information Leak Prevention**: `correctOption` is stripped from all API payloads via `sanitizeQuestion()`.
 2. **Idempotent Submissions**: Duplicate answer POST requests return the cached result without double-updating ability scores or corrupting session logs.
 3. **Zero-Crash Numerical Guards**: All math functions check `Number.isFinite()`, clamp extreme values, and handle edge cases gracefully to ensure no `NaN` or `Infinity` reaches the database.
+
+
+
+ability ($\theta$) Tracking: Dynamically estimates and stores each student’s ability level per topic.
+Rasch Model Math: Uses the 1PL Item Response Theory (IRT) logistic function $P(\text{Correct}) = \frac{1}{1 + e^{-(\theta - b)}}$ to calculate answer probabilities.
+Adaptive Question Selection: Automatically selects the next best question from the database whose difficulty ($b$) matches the student's current ability ($\theta$).
+Live Theta Updates: Recalculates student ability ($\theta$) in real-time after every submitted response.
